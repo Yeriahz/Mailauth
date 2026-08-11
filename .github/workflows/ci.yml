@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: lint and type check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install -e ".[dev]"
+      - name: ruff check
+        run: python -m ruff check .
+      - name: ruff format
+        run: python -m ruff format --check .
+      - name: mypy
+        run: python -m mypy mailauth
+
+  test:
+    name: test ${{ matrix.os }} py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows first: this is developed and run on Windows 11, so a Windows
+        # failure is a real failure rather than a portability curiosity.
+        os: [windows-latest, ubuntu-latest]
+        python: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - run: python -m pip install -e ".[dev]"
+
+      # The suite must pass with no outbound DNS. Nothing here grants network
+      # access to the tests, and any test that needed it would be marked `live`
+      # and deselected.
+      - name: pytest
+        run: python -m pytest --cov=mailauth --cov-report=term-missing
+
+  install:
+    name: clean install
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # The definition of done: a clean Windows box with only Python on it.
+      - run: python -m pip install pipx
+      - run: python -m pipx install .
+      - name: the console script runs
+        run: python -m pipx run --no-cache --spec . mailauth --version

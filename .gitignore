@@ -1,0 +1,41 @@
+# Run outputs, the SQLite run history, and generated client reports.
+# `out/*` rather than `out/`: git will not un-ignore a file inside an ignored
+# directory, so the negation below only works if the directory itself is not
+# excluded.
+out/*
+!out/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# Real prospect and target lists. The example list is committed; these are not.
+# This repository has been used to screen named local businesses, and their
+# names must never re-enter the tree.
+data/prospects.csv
+data/targets.txt
+
+# Databases and local secrets, wherever they land.
+*.db
+*.sqlite
+*.sqlite3
+.env
+.env.*

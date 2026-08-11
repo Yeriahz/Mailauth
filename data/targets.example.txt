@@ -1,0 +1,19 @@
+# Example target list for `mailauth check --file`.
+#
+# Format: one domain per line. Blank lines are skipped, and any line whose
+# first non-space character is # is treated as a comment, so a list can carry
+# notes alongside the domains.
+#
+# Real target lists are not committed to this repository. Keep yours outside
+# the tree, or at data/targets.txt, which is gitignored.
+#
+# Usage:
+#   mailauth check --file data/targets.example.txt
+#   mailauth batch  data/prospects.csv -o out/results.csv
+
+example.com
+example.org
+example.net
+
+# A domain that does not resolve, to exercise the unresolved path:
+does-not-exist.invalid

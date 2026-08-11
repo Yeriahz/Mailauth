@@ -1,0 +1,802 @@
+#
+# mailauth scoring weights.
+#
+# Every number a score is built from lives in this file. Nothing in the Python
+# code assigns a weight. The reason is auditability: when a client asks why
+# their domain scored 74, the answer has to be a list of findings and the
+# rationale attached to each one, not "the tool said so".
+#
+# Weights express how much a gap widens the window for someone to send mail as
+# the domain. They are not a severity ranking and they are not a probability.
+# Confidence is tracked separately, per finding, and never folded into weight -
+# a gap we are unsure about keeps its full weight and its low confidence, so a
+# high score built on guesswork can be sorted apart from one built on certainty.
+#
+# Copy this file, edit it, and pass it with --weights to override.
+#
+#
+
+schema_version = 1
+weights_version = "2026.08.1"
+
+# Score bands. A domain's risk label is the highest band its score reaches.
+[risk]
+high = 60
+medium = 30
+
+# Numeric value of each confidence level, used to aggregate a per-domain
+# confidence figure weighted by how much each finding contributed to the score.
+[confidence]
+high = 1.0
+medium = 0.6
+low = 0.3
+
+# Thresholds at which an aggregate confidence figure earns each label. A figure
+# at or above `high` reads HIGH, at or above `medium` reads MEDIUM, below that
+# LOW. These are scoring output, so they belong here rather than as literals in
+# the code.
+[confidence_labels]
+high = 0.8
+medium = 0.5
+
+# DERIVED: the ceiling applied per unobserved area is confidence_labels.medium.
+# It is not a number of its own and must not be pinned independently.
+#
+# The relationship: one area this run could not read should land the domain at
+# MEDIUM, and the lowest figure that still earns MEDIUM is the MEDIUM threshold
+# itself. Move that threshold and the ceiling follows, which is the point - a
+# ceiling pinned at 0.6 while the threshold sat at 0.5 was a number whose meaning
+# silently depended on a literal in another file.
+#
+# The ceiling is scaled per area by how much that area could have contributed:
+# the heaviest area takes the full cap, and an area whose findings are all
+# weight 0 is not capped at all. Failing to read a BIMI record costs the score
+# nothing, so it must cost confidence nothing; failing to read DMARC costs both.
+#
+# KNOWN CONSEQUENCE, documented so it is not rediscovered later as a bug: the
+# scale is normalised by whichever area is heaviest, so raising DMARC's weight
+# loosens DKIM's ceiling even though DKIM's own informational stake has not
+# changed. Accepted deliberately - the alternative is an absolute scale needing
+# its own hand-maintained maximum - but every ceiling moves when any heavy
+# weight moves.
+#
+# It compounds per unobserved area, so two unknowns read as worse than one. In
+# practice the second lands at LOW and further ones cannot go lower, which is
+# honest: "we do not know" has limited resolution.
+#
+# The cap exists because an unreachable finding carries weight 0, and confidence
+# is a weight-weighted mean over findings that scored above zero. Without it, a
+# domain whose DMARC lookup timed out reported confidence as though the record
+# had been read cleanly.
+
+# ---------------------------------------------------------------------------
+# DMARC rollout
+#
+# How the client-facing report stages a DMARC deployment. Not scoring: this
+# changes what the report advises, never what a domain scores, so it is
+# deliberately excluded from the weights digest. Two runs that differ only here
+# remain comparable.
+#
+# Two weeks per stage, not four. A small firm has two or three sending systems
+# and its aggregate reports show all of them inside a fortnight. Four weeks per
+# stage means three months from p=none to p=reject, which in practice means the
+# project is abandoned before it finishes.
+#
+# The pct ladder is walked rather than jumped: quarantining a quarter of failing
+# mail surfaces a forgotten sender as a complaint from one person rather than as
+# a department-wide outage.
+# ---------------------------------------------------------------------------
+
+[rollout]
+monitor_weeks = 2
+quarantine_weeks = 2
+pct_ladder = [25, 100]
+
+# ---------------------------------------------------------------------------
+# Mutually exclusive groups
+#
+# Codes that all assert the same underlying fact. Their combined contribution is
+# capped at the largest single member's weight in the active profile, so a
+# domain is charged once for the fact rather than once per way of observing it.
+#
+# DERIVED: the cap is max(member weights), not a number of its own. The worst
+# state sets the price.
+# ---------------------------------------------------------------------------
+
+[groups]
+dkim_no_usable_key = [
+    "dkim.none_found",
+    "dkim.unparseable",
+    "dkim.revoked",
+    "dkim.delegation_without_key",
+]
+
+# ---------------------------------------------------------------------------
+# SPF
+# ---------------------------------------------------------------------------
+
+[findings."spf.absent"]
+weight = 30
+confidence = "high"
+rationale = """
+No statement at all about who may send. SPF is one of the two mechanisms DMARC
+can align against, so its absence also caps what DMARC can ever do."""
+
+[findings."spf.multiple_records"]
+weight = 30
+confidence = "high"
+rationale = """
+Two SPF records is worse than one bad one. RFC 7208 makes a receiver return
+permerror rather than pick, so SPF is not evaluated at all. Scored the same as
+having none, because operationally that is what it is."""
+
+[findings."spf.all_pass"]
+weight = 30
+confidence = "high"
+rationale = """
++all states that every host on the internet is authorised. It is rare, and it is
+almost always a typo for -all or a copied example nobody read."""
+
+[findings."spf.all_neutral"]
+weight = 20
+confidence = "high"
+rationale = """
+?all produces no verdict for unlisted senders, so SPF contributes nothing to a
+DMARC evaluation. Less bad than +all only because it does not actively assert
+that forgers are authorised."""
+
+[findings."spf.no_all"]
+weight = 12
+confidence = "high"
+rationale = """
+Without a terminal mechanism the default is neutral, the same outcome as ?all.
+Weighted slightly lower because it is more often an unfinished record than a
+deliberate choice."""
+
+[findings."spf.all_softfail"]
+weight = 4
+confidence = "high"
+rationale = """
+~all is the correct setting during a rollout and a mild gap once reports are
+clean. Low weight: it is a reasonable resting state, not a hole."""
+
+[findings."spf.all_hardfail"]
+weight = 0
+confidence = "high"
+rationale = "The intended end state."
+
+[findings."spf.lookup_limit_exceeded"]
+weight = 25
+confidence = "high"
+rationale = """
+Over the limit the record is a permerror and receivers stop evaluating. The
+domain has an SPF record that does nothing, which is more dangerous than having
+none because everyone involved believes it works."""
+
+[findings."spf.lookup_limit_near"]
+weight = 6
+confidence = "high"
+rationale = """
+Not broken, but one new sending service away from breaking, and nothing warns
+anyone when it happens."""
+
+[findings."spf.lookup_limit_ok"]
+weight = 0
+confidence = "high"
+rationale = "No gap."
+
+[findings."spf.void_limit_exceeded"]
+weight = 12
+confidence = "high"
+rationale = """
+The void lookup limit is separate from the ten-lookup limit and passing it is
+its own permerror. It usually means includes for services that were cancelled
+years ago and never removed."""
+
+[findings."spf.syntax_error"]
+weight = 25
+confidence = "high"
+rationale = """
+An invalid term makes the whole record a permerror. Same practical outcome as
+exceeding the lookup limit."""
+
+[findings."spf.include_loop"]
+weight = 25
+confidence = "high"
+rationale = "A cyclic chain can never finish evaluating, so the record permerrors."
+
+[findings."spf.nested_multiple"]
+weight = 20
+confidence = "high"
+rationale = """
+A nested domain publishing two SPF records breaks every record that includes it,
+including this one. Not the domain owner's fault, but it is their problem."""
+
+[findings."spf.ptr"]
+weight = 5
+confidence = "high"
+rationale = """
+RFC 7208 deprecates ptr and some receivers ignore it entirely, so senders that
+depend on it may fail. It is also slow and unreliable to evaluate."""
+
+[findings."spf.unresolved_include"]
+weight = 4
+confidence = "high"
+rationale = """
+An include pointing at a name with no SPF record. Spends a lookup, counts toward
+the void limit, and authorises nobody."""
+
+[findings."spf.duplicate_include"]
+weight = 3
+confidence = "high"
+rationale = "Spends one of ten lookups twice for the same set of senders."
+
+[findings."spf.multiple_all"]
+weight = 5
+confidence = "high"
+rationale = """
+Only the first all is used. A second one usually means someone appended to the
+record without reading it, and believes a setting is in effect that is not."""
+
+[findings."spf.terms_after_all"]
+weight = 6
+confidence = "high"
+rationale = """
+Mechanisms after all are never evaluated, so a sender someone deliberately added
+is not actually authorised."""
+
+[findings."spf.redirect_ignored"]
+weight = 8
+confidence = "high"
+rationale = """
+A redirect preceded by an all is dead code. The record does something other than
+what it reads as."""
+
+[findings."spf.depth_exceeded"]
+weight = 8
+confidence = "high"
+rationale = "Nesting this deep will exhaust the lookup budget before it resolves."
+
+[findings."spf.macro"]
+weight = 0
+confidence = "high"
+rationale = """
+Legal and occasionally necessary. Recorded because a record using macros cannot
+be verified by reading it, which matters when handing it to a client."""
+
+[findings."spf.include_unreachable"]
+weight = 0
+confidence = "low"
+rationale = """
+Our resolver could not follow the chain. That is a fact about our vantage point,
+not about the domain, so it carries no weight."""
+
+# ---------------------------------------------------------------------------
+# DMARC
+# ---------------------------------------------------------------------------
+
+[findings."dmarc.absent"]
+weight = 40
+confidence = "high"
+rationale = """
+The single largest weight in the file. Without DMARC, SPF and DKIM failures have
+no consequence: the mail is delivered anyway and the domain owner never learns
+it happened. Absence in DNS is absence, so confidence is high."""
+
+[findings."dmarc.multiple_records"]
+weight = 40
+confidence = "high"
+rationale = "Several records means receivers apply none. Equivalent to having none."
+
+[findings."dmarc.invalid_policy"]
+weight = 35
+confidence = "high"
+rationale = """
+A record without a valid p tag is discarded by receivers. Slightly below absent
+only because the intent is visible and the fix is one tag."""
+
+[findings."dmarc.policy_none"]
+weight = 25
+confidence = "high"
+rationale = """
+Monitoring only. Reports can be collected but nothing is blocked. This is the
+correct first stage of a rollout, which is why it is not weighted like absence,
+and a real gap when a domain has been parked here for years."""
+
+[findings."dmarc.policy_quarantine"]
+weight = 6
+confidence = "high"
+rationale = """
+Failing mail is treated as suspicious rather than rejected. A reasonable resting
+place for a small firm, and short of the end state."""
+
+[findings."dmarc.policy_reject"]
+weight = 0
+confidence = "high"
+rationale = "The intended end state."
+
+[findings."dmarc.pct_partial"]
+weight = 15
+confidence = "high"
+rationale = """
+The published policy overstates what is enforced. A domain reading p=reject
+while pct=20 is enforcing on a fifth of its mail, and everyone involved believes
+it is fully deployed."""
+
+[findings."dmarc.invalid_pct"]
+weight = 3
+confidence = "high"
+rationale = "Unparseable tag. Receivers default to 100, but the intent is unclear."
+
+[findings."dmarc.no_rua"]
+weight = 10
+confidence = "high"
+rationale = """
+No reports means no visibility into who is sending as the domain, and no safe
+path to tightening the policy later. Reports are the input to every subsequent
+decision."""
+
+[findings."dmarc.rua_present"]
+weight = 0
+confidence = "high"
+rationale = "No gap."
+
+[findings."dmarc.rua_unauthorized"]
+weight = 12
+confidence = "high"
+rationale = """
+The reporting destination has not published the RFC 7489 authorization record,
+so receivers send nothing. The configuration looks complete and produces no data,
+with no error anywhere to signal it. Weighted above no_rua because it also
+consumes the owner's belief that reporting is handled."""
+
+[findings."dmarc.ruf_unauthorized"]
+weight = 2
+confidence = "high"
+rationale = """
+Same failure on forensic reports. Low weight because most large receivers do not
+send forensic reports at all."""
+
+[findings."dmarc.sp_weaker"]
+weight = 12
+confidence = "high"
+rationale = """
+Subdomains fall under a weaker policy than the parent, including subdomains
+nobody deliberately created. A common way an otherwise enforced domain stays
+usable for forgery."""
+
+[findings."dmarc.sp_differs"]
+weight = 2
+confidence = "high"
+rationale = "Deliberate difference, recorded rather than penalised."
+
+[findings."dmarc.sp_absent"]
+weight = 2
+confidence = "high"
+rationale = """
+Subdomains inherit the parent policy when sp is absent, which is usually the
+intent. Low weight, kept non-zero because being explicit removes a question
+nobody should have to ask."""
+
+[findings."dmarc.strict_alignment"]
+weight = 0
+confidence = "high"
+rationale = """
+Stricter than the default. Recorded because it is a frequent cause of a
+legitimate sender failing after a subdomain change, not because it is a gap."""
+
+[findings."dmarc.fo_without_ruf"]
+weight = 0
+confidence = "high"
+rationale = "Harmless. Recorded as a sign the record was assembled from an example."
+
+[findings."dmarc.nonstandard_ri"]
+weight = 0
+confidence = "high"
+rationale = "Most receivers ignore it. Informational."
+
+[findings."dmarc.unreachable"]
+weight = 0
+confidence = "low"
+rationale = "A failure of our vantage point. Carries no weight."
+
+# ---------------------------------------------------------------------------
+# DKIM
+#
+# Note the confidence values throughout this section. Selectors cannot be
+# enumerated from outside a domain, so nothing here may be stated with high
+# confidence, no matter how many selectors were tried.
+# ---------------------------------------------------------------------------
+
+[findings."dkim.none_found"]
+weight = 15
+confidence = "low"
+rationale = """
+Real weight, because unsigned outbound mail cannot survive forwarding and cannot
+carry DMARC alignment on its own. Low confidence, because a miss across a guess
+list is not proof of absence and never will be. This pairing is the whole reason
+weight and confidence are separate fields."""
+
+[findings."dkim.key_found"]
+weight = 0
+confidence = "high"
+rationale = "No gap. A key that answers is a key that exists."
+
+[findings."dkim.revoked"]
+weight = 15
+confidence = "high"
+rationale = """
+DERIVED: equal to dkim.none_found in the same profile. If none_found moves in a
+profile, this must move with it, in that profile.
+
+An empty p tag withdraws the key, so a revoked-only domain is an unsigned
+domain. This finding suppresses none_found - the domain did publish something -
+so it has to carry none_found's weight itself, or a withdrawn key scores better
+than no key at all. Parity, not a premium: revocation is usually deliberate,
+either a rotation left unfinished or a sender retired on purpose.
+
+High confidence: the record was retrieved and read, not inferred from a selector
+guess."""
+
+[findings."dkim.testing_mode"]
+weight = 10
+confidence = "high"
+rationale = """
+t=y asks receivers to treat a signature failure as though the message were
+unsigned, so the signature protects nothing. Almost always a rollout flag that
+was never removed."""
+
+[findings."dkim.key_too_short"]
+weight = 12
+confidence = "high"
+rationale = """
+Below the RFC 8301 floor. Some receivers ignore signatures made with these keys
+outright, so the domain is effectively unsigned for those receivers."""
+
+# PROPOSED WEIGHT - awaiting a decision, currently 0 so it changes no score.
+# A key whose padding was missing but which parses once restored is functionally
+# fine, so this is a note rather than a defect. 0 is the no-op choice, not a
+# considered value: see the report accompanying this change.
+[findings."dkim.padding_repaired"]
+weight = 0
+confidence = "high"
+rationale = """
+The published p= value was missing its base64 padding. The key is valid and was
+read correctly once the padding was restored, so nothing about the domain's mail
+is broken. It is recorded because some strict parsers reject an unpadded value,
+and because a record that differs from what the provider supplied is worth
+knowing about."""
+
+[findings."dkim.key_1024"]
+weight = 3
+confidence = "high"
+rationale = "Accepted everywhere today, below the current recommendation of 2048."
+
+[findings."dkim.unparseable"]
+weight = 20
+confidence = "high"
+rationale = """
+DERIVED: dkim.none_found in the same profile, plus a premium of 5. If none_found
+moves in a profile, this must move with it, in that profile.
+
+A key record is published at the selector and no receiver can read it. Usually
+the value was altered on its way into a DNS panel: a truncated paste, or quote
+characters left in. Like dkim.revoked this suppresses none_found, so it must
+carry that weight to reach parity with an unsigned domain. The premium on top is
+the part that distinguishes it: something was meant to be signing mail and
+silently is not, and unlike a selector miss we observed it directly rather than
+inferring it from absence.
+
+High confidence: the record was retrieved and inspected."""
+
+[findings."dkim.delegation_without_key"]
+weight = 2
+confidence = "high"
+rationale = """
+DERIVED: flat, deliberately independent of dkim.none_found in every profile.
+
+A selector's CNAME resolves and the name it points at publishes no key. The
+provider-side half of DKIM setup was never finished. Unlike the two states
+above, this one does NOT suppress none_found - a delegation is not a published
+key - so none_found still fires alongside it and already carries the posture.
+Anything larger here double-counts the same fact twice. This is a detail
+finding: it names which selector to go and switch on. It is also what is left
+behind on a domain that already has a working key elsewhere, where it is
+untidy rather than harmful, and the weight has to be small enough to suit that
+case too.
+
+High confidence: the CNAME was resolved and its target queried."""
+
+[findings."dkim.m365_tenant_signing"]
+weight = 12
+confidence = "medium"
+rationale = """
+Microsoft 365 signs as the tenant until DKIM is enabled for the custom domain.
+The selectors exist either way, so their presence is misleading: DMARC still
+fails on DKIM because the signature does not carry this domain."""
+
+[findings."dkim.unreachable"]
+weight = 0
+confidence = "low"
+rationale = """
+Every selector probe failed to return an answer, so this run learned nothing
+about the domain's DKIM. Weight 0, matching mx.unreachable and
+dmarc.unreachable: a failure of our own vantage point is not a gap in the
+domain, and scoring it would charge a prospect for our network conditions.
+
+Note that this is not the same as dkim.none_found. That one means we asked and
+nothing answered, which is real if weak evidence. This one means we never got
+to ask."""
+
+[findings."dkim.wildcard"]
+weight = 0
+confidence = "high"
+rationale = """
+Not a gap in itself, and it makes the DKIM assessment impossible rather than
+negative. Carrying weight here would be scoring our own blindness."""
+
+[findings."dns.wildcard"]
+weight = 5
+confidence = "high"
+rationale = """
+Every name under the domain resolves, including ones nobody created. Worth
+raising on its own merits, separately from what it does to DKIM assessment."""
+
+# ---------------------------------------------------------------------------
+# MX
+# ---------------------------------------------------------------------------
+
+[findings."mx.absent"]
+weight = 0
+confidence = "high"
+rationale = """
+Deliberately zero. A domain with no MX does not receive mail, and scoring that
+as a gap is what put parked domains at the top of the old worklist. The posture
+field records it instead."""
+
+[findings."mx.null"]
+weight = 0
+confidence = "high"
+rationale = "The correct configuration for a domain that receives no mail."
+
+[findings."mx.present"]
+weight = 0
+confidence = "high"
+rationale = "Informational."
+
+[findings."mx.single"]
+weight = 2
+confidence = "high"
+rationale = """
+Delivery depends on one host being reachable. Common and survivable; recorded
+because it is a real single point of failure for inbound mail."""
+
+[findings."mx.target_is_cname"]
+weight = 8
+confidence = "high"
+rationale = """
+RFC 2181 forbids it. Some receivers reject outright and others follow it, so
+inbound delivery becomes inconsistent in a way that is hard to diagnose."""
+
+[findings."mx.target_unresolvable"]
+weight = 15
+confidence = "high"
+rationale = """
+A published MX host with no address records cannot receive mail. When every host
+is in this state the domain is silently losing inbound mail."""
+
+[findings."mx.no_ipv6"]
+weight = 0
+confidence = "high"
+rationale = "Common and not a gap. Recorded for completeness."
+
+[findings."mx.unreachable"]
+weight = 0
+confidence = "low"
+rationale = "A failure of our vantage point."
+
+# ---------------------------------------------------------------------------
+# Supporting records
+#
+# These are all weighted low. A firm with no DMARC and no SPF should not have
+# its score moved appreciably by the absence of BIMI.
+# ---------------------------------------------------------------------------
+
+[findings."tlsrpt.absent"]
+weight = 2
+confidence = "high"
+rationale = """
+Without TLS-RPT, a downgrade or certificate failure on inbound mail is invisible
+to the domain owner. Low weight: it is a visibility improvement, not a control."""
+
+[findings."tlsrpt.no_rua"]
+weight = 1
+confidence = "high"
+rationale = "Published but names nowhere to send reports."
+
+[findings."mtasts.absent"]
+weight = 3
+confidence = "high"
+rationale = """
+Without MTA-STS, an attacker positioned between mail servers can strip TLS and
+the message is delivered in the clear. Weighted low because it requires an
+active network position, which is a much higher bar than sending a forged
+email."""
+
+[findings."mtasts.no_id"]
+weight = 2
+confidence = "high"
+rationale = "Without an id tag, sender caches are never refreshed when the policy changes."
+
+[findings."mtasts.policy_unreachable"]
+weight = 4
+confidence = "high"
+rationale = """
+The DNS record promises a policy that cannot be fetched, so senders that honour
+MTA-STS get nothing. Configured and non-functional."""
+
+[findings."mtasts.testing"]
+weight = 1
+confidence = "high"
+rationale = "The correct first stage of an MTA-STS rollout."
+
+[findings."mtasts.mode_none"]
+weight = 2
+confidence = "high"
+rationale = "Mode none withdraws a previously published policy."
+
+[findings."bimi.no_logo"]
+weight = 0
+confidence = "high"
+rationale = "Informational."
+
+[findings."dnssec.unsigned"]
+weight = 1
+confidence = "medium"
+rationale = """
+The ordinary state of most domains. Recorded for completeness and weighted
+almost to nothing, because recommending DNSSEC to a small accounting firm ahead
+of DMARC would be advice that does not match the risk. Confidence is medium
+because the AD flag depends on the recursive resolver validating and reporting
+it."""
+
+# ---------------------------------------------------------------------------
+# Interaction findings
+#
+# Computed after the individual checks, from combinations no single check can
+# see. Each inherits the confidence of its weakest input.
+# ---------------------------------------------------------------------------
+
+[findings."combo.enforcing_without_dkim"]
+weight = 10
+confidence = "low"
+rationale = """
+An enforcing DMARC policy with no signature to survive forwarding risks the
+domain's own forwarded mail. Weighted modestly and marked low confidence because
+it rests entirely on a selector probe that cannot prove absence - the point of
+this finding is to prompt a question, not to assert a fault."""
+
+[findings."combo.hardfail_never_evaluated"]
+weight = 15
+confidence = "high"
+rationale = """
+The record reads as strict and is not, because evaluation permerrors before
+reaching the terminal mechanism. Scored on top of the lookup-limit finding
+because the misleading appearance is its own problem: it is why nobody has
+fixed the underlying record."""
+
+[findings."combo.enforcing_without_reporting"]
+weight = 10
+confidence = "high"
+rationale = """
+Receivers are acting on mail and nobody is collecting the data showing which
+senders are affected. The first signal of a problem will be a person saying
+their mail never arrived."""
+
+[findings."combo.reporting_never_arrives"]
+weight = 8
+confidence = "high"
+rationale = """
+Scored on top of dmarc.rua_unauthorized because the combination consumes the
+owner's belief that reporting is handled, which delays every later step."""
+
+[findings."combo.no_authentication_at_all"]
+weight = 15
+confidence = "low"
+rationale = """
+A mail-receiving domain with neither mechanism found. Scored on top of the
+individual absences because the combination is what makes forgery trivially
+easy rather than merely possible. Low confidence, inherited from the DKIM half
+of the claim."""
+
+# ---------------------------------------------------------------------------
+# Profiles
+#
+# Sparse overlays on [findings]. Only the keys that differ need restating, and
+# a profile may override weight, confidence, or both.
+# ---------------------------------------------------------------------------
+
+[profiles.accounting]
+description = """
+Accounting, tax and bookkeeping firms. Client-fund wire fraud is the dominant
+loss event, and it starts with a forged email from a domain the client trusts.
+Everything that makes domain forgery easy is weighted up; everything that
+protects mail in transit is weighted down, because the realistic attacker is
+sending an email, not sitting on the network path."""
+
+[profiles.accounting.findings."dmarc.absent"]
+weight = 45
+rationale = """
+Raised from 40. For a firm that emails clients about money movement, the ability
+of anyone to send convincing mail as the firm is the whole loss scenario."""
+
+[profiles.accounting.findings."dmarc.policy_none"]
+weight = 30
+rationale = """
+Raised from 25. Monitoring-only is worth less here than elsewhere, because the
+attack that matters is stopped by enforcement, not by observation."""
+
+[profiles.accounting.findings."dkim.none_found"]
+weight = 18
+rationale = """
+Raised from 15. Forwarded mail is routine between a firm and its clients.
+
+Two other entries are derived from this number and are overridden below to match
+it: dkim.revoked (parity) and dkim.unparseable (parity plus 5). Changing this
+weight without changing those two reintroduces an inversion where a domain with
+a withdrawn key scores better than a domain with no key at all."""
+
+[profiles.accounting.findings."dkim.revoked"]
+weight = 18
+rationale = """
+DERIVED: equal to dkim.none_found under this profile, which is 18 rather than the
+base 15. Without this override a revoked-only domain scores 3 points below a
+domain that published nothing, which is the inversion this relationship exists to
+prevent."""
+
+[profiles.accounting.findings."dkim.unparseable"]
+weight = 23
+rationale = """
+DERIVED: dkim.none_found under this profile (18) plus the standard premium of 5.
+Without this override the premium shrinks to 2 points, because the base weight of
+20 was derived against the default none_found of 15."""
+
+[profiles.accounting.findings."mtasts.absent"]
+weight = 1
+rationale = """
+Lowered from 3. Requires an attacker on the network path, which is not the
+threat model that costs these firms money."""
+
+[profiles.accounting.findings."dnssec.unsigned"]
+weight = 0
+rationale = "Lowered from 1. Not a conversation worth having before DMARC is in place."
+
+[profiles.strict]
+description = """
+Every gap counted at full weight, with the supporting records treated as real
+requirements rather than nice to have. Intended for assessing a domain that
+already has DMARC enforced and wants to know what is left."""
+
+[profiles.strict.findings."spf.all_softfail"]
+weight = 10
+rationale = "Raised from 4. At this maturity level, ~all is an unfinished rollout."
+
+[profiles.strict.findings."dmarc.policy_quarantine"]
+weight = 12
+rationale = "Raised from 6. Quarantine is a stopping point on the way to reject."
+
+[profiles.strict.findings."tlsrpt.absent"]
+weight = 6
+rationale = "Raised from 2."
+
+[profiles.strict.findings."mtasts.absent"]
+weight = 8
+rationale = "Raised from 3."
+
+[profiles.strict.findings."dnssec.unsigned"]
+weight = 5
+rationale = "Raised from 1."
+
+[profiles.strict.findings."mx.no_ipv6"]
+weight = 2
+rationale = "Raised from 0."
