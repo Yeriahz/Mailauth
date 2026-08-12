@@ -82,15 +82,16 @@ medium = 0.5
 # stage means three months from p=none to p=reject, which in practice means the
 # project is abandoned before it finishes.
 #
-# The pct ladder is walked rather than jumped: quarantining a quarter of failing
-# mail surfaces a forgotten sender as a complaint from one person rather than as
-# a department-wide outage.
+# The ladder has three rungs and no pct tag. The current DMARC standard removed
+# pct, and receivers never implemented it consistently while it existed, so a
+# percentage in the record never reliably described the share of mail covered.
+# The graduated exposure it was meant to provide now comes from the time spent
+# at p=quarantine before moving to p=reject.
 # ---------------------------------------------------------------------------
 
 [rollout]
 monitor_weeks = 2
 quarantine_weeks = 2
-pct_ladder = [25, 100]
 
 # ---------------------------------------------------------------------------
 # Mutually exclusive groups
@@ -287,6 +288,20 @@ it happened. Absence in DNS is absence, so confidence is high."""
 weight = 40
 confidence = "high"
 rationale = "Several records means receivers apply none. Equivalent to having none."
+
+[findings."dmarc.policy_test_mode"]
+weight = 0
+confidence = "high"
+rationale = """
+The record sets t=y (RFC 9989 section 4.7), which asks receivers not to apply
+the published policy while the domain owner tests. Receivers still on RFC 7489
+ignore the tag under section 6.3 and apply the policy as written, so handling
+differs between receivers and cannot be determined from DNS.
+
+Weight 0 deliberately. This records an observable that changes how the rest of
+the record should be read; what it is worth is a separate decision and has not
+been made. Confidence is high because the tag was read directly from the
+record."""
 
 [findings."dmarc.invalid_policy"]
 weight = 35

@@ -99,7 +99,10 @@ def test_a_domain_at_reject_with_partial_pct_gets_a_repair() -> None:
     )
     suggestions = dmarc_rollout("x.test", result)
     assert len(suggestions) == 1
-    assert "pct=100" in suggestions[0].value
+    # The repair removes the tag rather than setting it to 100: the current
+    # standard removed pct, so a conforming receiver ignores any value.
+    assert "pct" not in suggestions[0].value
+    assert "removes the tag" in suggestions[0].note
     # The existing reporting address must be preserved, not replaced.
     assert "mailto:d@x.test" in suggestions[0].value
 
@@ -380,13 +383,23 @@ def test_the_rollout_defaults_to_two_weeks_per_stage() -> None:
     assert rollout.quarantine_weeks == 2
 
 
-def test_the_pct_ladder_is_explicit_rather_than_jumping_to_100() -> None:
-    from mailauth.report import load_rollout
+def test_the_ladder_has_three_rungs_and_no_percentage() -> None:
+    """pct was removed from DMARC, so the ladder is none -> quarantine -> reject.
 
-    ladder = load_rollout().pct_ladder
-    assert ladder[0] < 100, ladder
-    assert ladder[-1] == 100, ladder
-    assert list(ladder) == sorted(ladder), ladder
+    The graduated exposure pct was meant to give now comes from the time spent
+    at quarantine, which is what monitor_weeks and quarantine_weeks control.
+    """
+    from mailauth.report import Rollout, load_rollout
+
+    rollout = load_rollout()
+    assert not hasattr(rollout, "pct_ladder")
+    assert set(Rollout.__dataclass_fields__) == {"monitor_weeks", "quarantine_weeks"}
+
+    policies = [
+        s.value.split("p=", 1)[1].split(";", 1)[0]
+        for s in dmarc_rollout("x.test", result_with())
+    ]
+    assert policies == ["none", "quarantine", "reject"], policies
 
 
 def test_the_generated_rollout_uses_the_configured_interval() -> None:
@@ -397,14 +410,29 @@ def test_the_generated_rollout_uses_the_configured_interval() -> None:
     assert f"{weeks} weeks" in stages
 
 
-def test_the_generated_rollout_walks_the_pct_ladder() -> None:
-    from mailauth.report import load_rollout
+def test_no_generated_record_carries_a_pct_tag() -> None:
+    """A record meaning the same thing to a 7489 and a 9989 receiver."""
+    from mailauth.models import DmarcResult
 
-    ladder = load_rollout().pct_ladder
-    values = [s.value for s in dmarc_rollout("x.test", result_with())]
-    quarantine = [v for v in values if "p=quarantine" in v]
-    assert quarantine, values
-    assert f"pct={ladder[0]}" in quarantine[0], quarantine[0]
+    states = [
+        result_with(),
+        result_with(dmarc=DmarcResult(record="v=DMARC1; p=none", tags={"p": "none"})),
+        result_with(
+            dmarc=DmarcResult(
+                record="v=DMARC1; p=quarantine; rua=mailto:d@x.test",
+                tags={"p": "quarantine", "rua": "mailto:d@x.test"},
+            )
+        ),
+        result_with(
+            dmarc=DmarcResult(
+                record="v=DMARC1; p=reject; pct=20; rua=mailto:d@x.test",
+                tags={"p": "reject", "pct": "20", "rua": "mailto:d@x.test"},
+            )
+        ),
+    ]
+    for state in states:
+        for suggestion in dmarc_rollout("x.test", state):
+            assert "pct" not in suggestion.value, suggestion.value
 
 
 def test_the_intervals_come_from_the_config_file(tmp_path: Path) -> None:
@@ -418,7 +446,147 @@ def test_the_intervals_come_from_the_config_file(tmp_path: Path) -> None:
     assert load_rollout(edited).monitor_weeks == 6
 
 
-def test_no_bare_pct_literal_remains_in_the_renderer() -> None:
-    """pct=100 was hardcoded in seven places with no ladder at all."""
+def test_no_generated_record_template_carries_pct() -> None:
+    """pct=100 was once hardcoded in seven places. Now it is in none of them.
+
+    The tag may still be named in the repair prose, which explains why it is
+    being removed, but it must not appear inside a v=DMARC1 record template.
+    """
     source = (Path("mailauth") / "report.py").read_text(encoding="utf-8")
-    assert "pct=100" not in source
+    for line in source.splitlines():
+        if "v=DMARC1" in line:
+            assert "pct" not in line, line.strip()
+
+
+# ---------------------------------------------------------------------------
+# the DKIM precondition on the enforcing rungs
+#
+# Both rungs are gated, not only the last one. `enforcing` at engine.py:66 is
+# policy in ("quarantine", "reject"), so a domain reaching stage 2 without a
+# usable key is already in the state combo.enforcing_without_dkim calls
+# critical, and it sits there for the whole quarantine period.
+# ---------------------------------------------------------------------------
+
+SIGNING_PRECONDITION = "only once DKIM is signing"
+
+
+def rollout_for(**dkim_kwargs: object) -> list:
+    from mailauth.models import DkimResult
+
+    return dmarc_rollout(
+        "x.test",
+        result_with(dkim=DkimResult(**dkim_kwargs)),  # type: ignore[arg-type]
+    )
+
+
+def enforcing_rungs(suggestions: list) -> list:
+    return [s for s in suggestions if "p=quarantine" in s.value or "p=reject" in s.value]
+
+
+def test_both_enforcing_rungs_are_gated_when_no_usable_key_was_found() -> None:
+    rungs = enforcing_rungs(rollout_for(selectors_tried=["a"]))
+    assert len(rungs) == 2, [s.stage for s in rungs]
+    for rung in rungs:
+        assert SIGNING_PRECONDITION in rung.stage, rung.stage
+        assert "does not survive forwarding" in rung.note
+
+
+def test_a_delegation_with_an_empty_target_is_gated_like_no_key() -> None:
+    """Mail is unsigned either way, so the advice must be the same either way."""
+    from mailauth.models import DkimKey
+
+    rungs = enforcing_rungs(
+        rollout_for(
+            selectors_tried=["selector1"],
+            keys=[
+                DkimKey(
+                    selector="selector1",
+                    source="cname",
+                    cname_target="s1._domainkey.tenant.onmicrosoft.com",
+                    parse_error="the delegated name publishes no key record",
+                )
+            ],
+        )
+    )
+    assert rungs
+    for rung in rungs:
+        assert SIGNING_PRECONDITION in rung.stage, rung.stage
+
+
+def test_an_unobserved_wildcard_zone_is_gated() -> None:
+    """Nothing can be established either way, so the caveat stands."""
+    rungs = enforcing_rungs(rollout_for(selectors_tried=["a"], wildcard=True))
+    assert rungs
+    for rung in rungs:
+        assert SIGNING_PRECONDITION in rung.stage, rung.stage
+
+
+def test_a_usable_key_leaves_the_ladder_untouched() -> None:
+    from mailauth.models import DkimKey
+
+    rungs = enforcing_rungs(
+        rollout_for(
+            selectors_tried=["selector1"],
+            keys=[DkimKey(selector="selector1", source="txt", record="v=DKIM1", bits=2048)],
+        )
+    )
+    assert len(rungs) == 2
+    for rung in rungs:
+        assert SIGNING_PRECONDITION not in rung.stage, rung.stage
+        assert "does not survive forwarding" not in rung.note
+
+
+def test_the_gate_reads_usable_keys_rather_than_key_records() -> None:
+    """The predicate must match engine.py:71, which uses any_key_found.
+
+    A delegation produces a DkimKey with no usable key behind it. Gating on
+    `keys` rather than `usable_keys` would wave that domain through.
+    """
+    from mailauth.models import DkimKey, DkimResult
+
+    delegation = DkimResult(
+        selectors_tried=["selector1"],
+        keys=[
+            DkimKey(
+                selector="selector1",
+                source="cname",
+                cname_target="s1._domainkey.tenant.onmicrosoft.com",
+                parse_error="the delegated name publishes no key record",
+            )
+        ],
+    )
+    assert delegation.keys, "the fixture must carry a key record"
+    assert not delegation.usable_keys, "and no usable key"
+    assert not delegation.any_key_found
+
+
+def test_the_prerequisite_step_appears_before_stage_two(weights: Weights) -> None:
+    """A client reading top to bottom must meet DKIM before the enforcing records."""
+    from mailauth.engine import check_domain
+
+    zone = {
+        ("x.test", "TXT"): ["v=spf1 -all"],
+        ("x.test", "MX"): ["10 mail.x.test"],
+        ("mail.x.test", "A"): ["192.0.2.1"],
+    }
+    markdown = render_markdown(score(check_domain(FakeResolver(zone), "x.test"), weights))
+
+    step = markdown.index("**Before stage 2 - set up DKIM**")
+    quarantine = markdown.index("p=quarantine")
+    reject = markdown.index("p=reject")
+    assert step < quarantine < reject
+
+
+def test_the_prerequisite_step_is_absent_when_a_key_is_present(
+    weights: Weights,
+) -> None:
+    from mailauth.engine import check_domain
+
+    zone = {
+        ("x.test", "TXT"): ["v=spf1 -all"],
+        ("x.test", "MX"): ["10 mail.x.test"],
+        ("mail.x.test", "A"): ["192.0.2.1"],
+        ("default._domainkey.x.test", "TXT"): [f"v=DKIM1; k=rsa; p={RSA_2048_P}"],
+    }
+    markdown = render_markdown(score(check_domain(FakeResolver(zone), "x.test"), weights))
+    assert "**Before stage 2 - set up DKIM**" not in markdown

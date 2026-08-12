@@ -33,7 +33,6 @@ class Rollout:
 
     monitor_weeks: int = 2
     quarantine_weeks: int = 2
-    pct_ladder: tuple[int, ...] = (25, 100)
 
 
 def load_rollout(path: Path | None = None) -> Rollout:
@@ -49,11 +48,9 @@ def load_rollout(path: Path | None = None) -> Rollout:
             section = tomllib.load(handle).get("rollout", {})
     except (FileNotFoundError, tomllib.TOMLDecodeError):
         return Rollout()
-    ladder = tuple(int(v) for v in section.get("pct_ladder", (25, 100)))
     return Rollout(
         monitor_weeks=int(section.get("monitor_weeks", 2)),
         quarantine_weeks=int(section.get("quarantine_weeks", 2)),
-        pct_ladder=ladder or (100,),
     )
 
 
@@ -89,6 +86,27 @@ def dmarc_rollout(domain: str, result: DomainResult) -> list[RecordSuggestion]:
     has_rua = bool(result.dmarc.tags.get("rua"))
     reporting = f"rua=mailto:dmarc@{domain}"
 
+    # The same predicate the interaction set uses at engine.py:71, so the advice
+    # and combo.enforcing_without_dkim cannot disagree about whether this domain
+    # has DKIM. `any_key_found` is bool(usable_keys), so a delegation resolving
+    # to nothing counts as no key, and `observed` is False on a wildcard zone
+    # where nothing can be established either way.
+    #
+    # Both enforcing rungs are gated, not only the last one: `enforcing` at
+    # engine.py:66 is policy in ("quarantine", "reject"), so a domain that
+    # reaches stage 2 without signing is already in the critical state and sits
+    # there for the whole quarantine period before stage 3 is even offered.
+    dkim_ready = result.dkim.any_key_found and result.dkim.observed
+    signing_caveat = (
+        " Do not publish this until the DKIM step below is done and the reports "
+        "show your mail carrying a valid signature. SPF does not survive "
+        "forwarding: when a message is forwarded the forwarding server becomes "
+        "the sender and SPF stops matching, and with no signature to fall back on "
+        "the message fails DMARC. Enforcing before then risks your own forwarded "
+        "mail being held or refused."
+    )
+    caveat_suffix = "" if dkim_ready else ", and only once DKIM is signing"
+
     suggestions: list[RecordSuggestion] = []
 
     if policy not in ("none", "quarantine", "reject"):
@@ -111,12 +129,15 @@ def dmarc_rollout(domain: str, result: DomainResult) -> list[RecordSuggestion]:
             RecordSuggestion(
                 host="_dmarc",
                 rtype="TXT",
-                value=f"v=DMARC1; p=quarantine; sp=quarantine; pct={rollout.pct_ladder[0]}; {reporting}; fo=1;",
-                stage=f"Stage 2 - after {rollout.monitor_weeks} weeks of clean reports",
+                value=f"v=DMARC1; p=quarantine; sp=quarantine; {reporting}; fo=1;",
+                stage=(
+                    f"Stage 2 - after {rollout.monitor_weeks} weeks of clean "
+                    f"reports{caveat_suffix}"
+                ),
                 note=(
                     "Move here only once the reports show every legitimate sender "
                     "passing. Failing mail is then treated as suspicious rather than "
-                    "delivered normally."
+                    "delivered normally." + ("" if dkim_ready else signing_caveat)
                 ),
             )
         )
@@ -124,11 +145,14 @@ def dmarc_rollout(domain: str, result: DomainResult) -> list[RecordSuggestion]:
             RecordSuggestion(
                 host="_dmarc",
                 rtype="TXT",
-                value=f"v=DMARC1; p=reject; sp=reject; pct={rollout.pct_ladder[-1]}; {reporting}; fo=1;",
-                stage=f"Stage 3 - after a further {rollout.quarantine_weeks} weeks",
+                value=f"v=DMARC1; p=reject; sp=reject; {reporting}; fo=1;",
+                stage=(
+                    f"Stage 3 - after a further {rollout.quarantine_weeks} "
+                    f"weeks{caveat_suffix}"
+                ),
                 note=(
                     "The end state. Mail that fails authentication is refused rather "
-                    "than delivered."
+                    "than delivered." + ("" if dkim_ready else signing_caveat)
                 ),
             )
         )
@@ -153,11 +177,15 @@ def dmarc_rollout(domain: str, result: DomainResult) -> list[RecordSuggestion]:
             RecordSuggestion(
                 host="_dmarc",
                 rtype="TXT",
-                value=f"v=DMARC1; p=quarantine; sp=quarantine; pct={rollout.pct_ladder[0]}; {reporting}; fo=1;",
-                stage=f"Next - after {rollout.monitor_weeks} weeks of clean reports",
+                value=f"v=DMARC1; p=quarantine; sp=quarantine; {reporting}; fo=1;",
+                stage=(
+                    f"Next - after {rollout.monitor_weeks} weeks of clean "
+                    f"reports{caveat_suffix}"
+                ),
                 note=(
                     "Move here once the aggregate reports show every legitimate sender "
                     "passing. If a sender is still failing, fix that sender first."
+                    + ("" if dkim_ready else signing_caveat)
                 ),
             )
         )
@@ -165,8 +193,12 @@ def dmarc_rollout(domain: str, result: DomainResult) -> list[RecordSuggestion]:
             RecordSuggestion(
                 host="_dmarc",
                 rtype="TXT",
-                value=f"v=DMARC1; p=reject; sp=reject; pct={rollout.pct_ladder[-1]}; {reporting}; fo=1;",
-                stage=f"Then - after a further {rollout.quarantine_weeks} weeks",
+                value=f"v=DMARC1; p=reject; sp=reject; {reporting}; fo=1;",
+                stage=(
+                    f"Then - after a further {rollout.quarantine_weeks} "
+                    f"weeks{caveat_suffix}"
+                ),
+                note=("" if dkim_ready else signing_caveat.strip()),
             )
         )
         return suggestions
@@ -176,11 +208,15 @@ def dmarc_rollout(domain: str, result: DomainResult) -> list[RecordSuggestion]:
             RecordSuggestion(
                 host="_dmarc",
                 rtype="TXT",
-                value=f"v=DMARC1; p=reject; sp=reject; pct={rollout.pct_ladder[-1]}; {reporting}; fo=1;",
-                stage=f"Next - after {rollout.quarantine_weeks} weeks of clean reports",
+                value=f"v=DMARC1; p=reject; sp=reject; {reporting}; fo=1;",
+                stage=(
+                    f"Next - after {rollout.quarantine_weeks} weeks of clean "
+                    f"reports{caveat_suffix}"
+                ),
                 note=(
                     "The remaining step. Quarantine already moves failing mail out of "
                     "the inbox; reject stops it being accepted at all."
+                    + ("" if dkim_ready else signing_caveat)
                 ),
             )
         )
@@ -193,7 +229,7 @@ def dmarc_rollout(domain: str, result: DomainResult) -> list[RecordSuggestion]:
             RecordSuggestion(
                 host="_dmarc",
                 rtype="TXT",
-                value=f"v=DMARC1; p=reject; sp=reject; pct={rollout.pct_ladder[-1]}; {reporting}; fo=1;",
+                value=f"v=DMARC1; p=reject; sp=reject; {reporting}; fo=1;",
                 stage="Repair",
                 note=(
                     "The policy is already at its end state but no reports are being "
@@ -207,13 +243,18 @@ def dmarc_rollout(domain: str, result: DomainResult) -> list[RecordSuggestion]:
             RecordSuggestion(
                 host="_dmarc",
                 rtype="TXT",
-                value=f"v=DMARC1; p=reject; sp=reject; pct={rollout.pct_ladder[-1]}; rua={existing_rua}; fo=1;",
+                value=f"v=DMARC1; p=reject; sp=reject; rua={existing_rua}; fo=1;",
                 stage="Repair",
                 note=(
-                    f"The record reads as p=reject but pct={tags.get('pct')} applies it "
-                    f"to only part of the mail stream. Setting pct={rollout.pct_ladder[-1]} "
-                    f"makes the "
-                    f"published policy and the enforced policy the same thing."
+                    f"The record reads as p=reject but carries pct={tags.get('pct')}, "
+                    f"which asks receivers to apply that policy to only part of the "
+                    f"mail stream. The replacement above removes the tag rather than "
+                    f"setting it to 100. Two reasons: the current DMARC standard "
+                    f"removed pct altogether, so a receiver following it ignores the "
+                    f"tag whatever its value; and receivers never implemented it "
+                    f"consistently while it existed, so the share of mail actually "
+                    f"covered was never the number in the record. Removing it makes "
+                    f"the published policy and the enforced policy the same thing."
                 ),
             )
         )
@@ -607,7 +648,25 @@ def render_markdown(result: DomainResult, firm_name: str | None = None) -> str:
             "because there is almost always a sending service nobody remembered."
         )
         lines.append("")
+        # The DKIM section sits below this one, so a client reading in order
+        # reaches p=reject before reading anything about signing. For a domain
+        # with no usable key that ordering is the wrong way round: both enforcing
+        # rungs depend on the DKIM step. Point at it here rather than moving it,
+        # so the ladder still reads as one sequence.
+        needs_signing = not (result.dkim.any_key_found and result.dkim.observed)
         for suggestion in dmarc_records:
+            if needs_signing and "p=quarantine" in suggestion.value:
+                lines.append("**Before stage 2 - set up DKIM**")
+                lines.append("")
+                lines.append(
+                    "Do the DKIM step in the next section before publishing either of "
+                    "the enforcing records below. It is not a DNS record this report "
+                    "can generate: the key is produced by your mail provider and you "
+                    "publish what it gives you. Until it is in place, mail from this "
+                    "domain carries no signature, and the two stages below ask "
+                    "receiving servers to act on mail that fails authentication."
+                )
+                lines.append("")
             lines.extend(_render_record(suggestion))
 
     lines.append("### DKIM")

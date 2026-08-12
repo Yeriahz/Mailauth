@@ -18,6 +18,7 @@ import csv
 import importlib.util
 import json
 import logging
+import re
 import subprocess
 import sys
 import time
@@ -131,6 +132,84 @@ def normalise_domain(raw: str) -> str:
     if domain.startswith("www."):
         domain = domain[4:]
     return domain.rstrip(".")
+
+
+# Longest a DNS name and a single label may be, per RFC 1035 section 2.3.4.
+MAX_DOMAIN_LENGTH = 253
+MAX_LABEL_LENGTH = 63
+
+# A hostname label is letters, digits and hyphens. Underscore is admitted
+# because the names this tool handles routinely carry it: _dmarc, _domainkey,
+# _smtp._tls. Anything else - a comma, a space, an @ - means the input is not a
+# domain name, and saying so is a statement about the input rather than a claim
+# about what DNS holds.
+_ALLOWED_CHARS = re.compile(r"[a-z0-9._-]")
+
+
+def domain_rejection(domain: str) -> str | None:
+    """Why `domain` cannot be a domain name, or None if it could be.
+
+    Called before anything reaches the resolver. Reporting a CSV row as "the
+    domain does not resolve" is a claim about the outside world made on the
+    strength of a query that could never have succeeded, and it is
+    indistinguishable in the output from a real domain that has been let lapse.
+
+    Checks run cheapest and most specific first, so the reason given names the
+    actual problem: a stray comma is reported as a stray comma rather than as
+    the missing dot it also causes.
+    """
+    if not domain:
+        return "the input is empty"
+    if len(domain) > MAX_DOMAIN_LENGTH:
+        return (
+            f"the input is {len(domain)} characters, longer than the "
+            f"{MAX_DOMAIN_LENGTH} a domain name may be"
+        )
+
+    illegal = sorted({c for c in domain if not _ALLOWED_CHARS.match(c)})
+    if illegal:
+        shown = ", ".join(repr(c) for c in illegal[:4])
+        more = f" and {len(illegal) - 4} more" if len(illegal) > 4 else ""
+        return f"the input contains {shown}{more}, which cannot appear in a domain name"
+
+    if "." not in domain:
+        return "the input has no dot, so it is a single label rather than a domain name"
+
+    for label in domain.split("."):
+        if not label:
+            return "the input has an empty label, from a leading, trailing or doubled dot"
+        if len(label) > MAX_LABEL_LENGTH:
+            return (
+                f"the label {label[:20]}... is {len(label)} characters, longer than "
+                f"the {MAX_LABEL_LENGTH} a single label may be"
+            )
+        if label.startswith("-") or label.endswith("-"):
+            return f"the label {label!r} starts or ends with a hyphen"
+    return None
+
+
+def partition_targets(raw_targets: list[str]) -> tuple[list[str], list[tuple[str, str]]]:
+    """Split inputs into checkable domains and rejections, preserving order."""
+    valid: list[str] = []
+    rejected: list[tuple[str, str]] = []
+    for target in raw_targets:
+        reason = domain_rejection(target)
+        if reason is None:
+            valid.append(target)
+        else:
+            rejected.append((target, reason))
+    return valid, rejected
+
+
+def report_rejections(rejected: list[tuple[str, str]]) -> None:
+    """Print rejections to stderr, kept out of the results entirely.
+
+    Deliberately not a finding: no score, no risk band, no severity. A rejected
+    input was never assessed, so it has nothing to report about a domain.
+    """
+    for target, reason in rejected:
+        shown = target if len(target) <= 60 else target[:57] + "..."
+        print(f"not a domain name, skipped: {shown!r} - {reason}", file=sys.stderr)
 
 
 def run_checks(
@@ -272,15 +351,27 @@ def cmd_check(args: argparse.Namespace) -> int:
 
     targets = [normalise_domain(d) for d in args.domains]
     if args.file:
-        with Path(args.file).open(encoding="utf-8") as handle:
+        # utf-8-sig so a byte order mark on the first line is consumed rather
+        # than becoming part of the first domain. Editors on Windows add one
+        # without saying so, and it is invisible in the resulting error.
+        with Path(args.file).open(encoding="utf-8-sig") as handle:
             targets += [
                 normalise_domain(line)
                 for line in handle
                 if line.strip() and not line.lstrip().startswith("#")
             ]
-    targets = [t for t in targets if t]
     if not targets:
         raise SystemExit("give at least one domain, or use --file")
+
+    # Reject what cannot be a domain before the resolver sees it. A rejection is
+    # a statement about the input and carries no score, risk band or severity.
+    targets, rejected = partition_targets(targets)
+    report_rejections(rejected)
+    if not targets:
+        raise SystemExit(
+            f"nothing left to check: all {len(rejected)} input(s) were rejected as "
+            f"not being domain names"
+        )
 
     store = None if args.no_db else Store(Path(args.db))
     client = build_client(args, store)
@@ -382,6 +473,22 @@ def cmd_batch(args: argparse.Namespace) -> int:
     rows = read_input_rows(args.infile)
     if not rows:
         raise SystemExit(f"{args.infile} contains no usable domains")
+
+    kept: list[dict[str, str]] = []
+    rejected: list[tuple[str, str]] = []
+    for row in rows:
+        reason = domain_rejection(row["domain"])
+        if reason is None:
+            kept.append(row)
+        else:
+            rejected.append((row["domain"], reason))
+    report_rejections(rejected)
+    rows = kept
+    if not rows:
+        raise SystemExit(
+            f"nothing left to check: all {len(rejected)} row(s) were rejected as not "
+            f"being domain names"
+        )
     passthrough_fields = list(rows[0].keys())
 
     store = None if args.no_db else Store(Path(args.db))

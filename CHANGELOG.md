@@ -9,6 +9,42 @@ public interface: they are the key into the weights file, the unit a diff is
 computed in, and the identifier a stored run is read back by. Renaming or
 removing one is a breaking change and gets an entry here.
 
+## [Unreleased]
+
+### Added
+
+- **`dmarc.policy_test_mode`** — a new finding, weight 0. Reports that a record
+  sets `t=y`, which asks receivers not to apply the published policy while the
+  owner tests. Receivers that do not recognise the tag ignore it and apply the
+  policy as written, so handling differs between receivers and cannot be
+  determined from DNS. Emitted only when `p` is `quarantine` or `reject`: on
+  `p=none` both receiver classes take no action and the finding's text would be
+  false, and on an absent or invalid `p` there is no policy to name.
+- **`DmarcResult.policy_test_mode`**, reading the `t` tag alone. The restriction
+  to an enforcing policy lives at the emit site, because it is a property of what
+  the finding asserts rather than of the tag.
+- **Input that cannot be a domain name is rejected before the resolver sees it.**
+  A CSV row or an address passed to `check` or `batch` was previously reported as
+  `the domain does not resolve`, which is a claim about the outside world made on
+  a query that could never have succeeded, and indistinguishable in the output
+  from a domain that had lapsed. Rejections carry no score, risk band or
+  severity, and issue no query.
+- **A byte order mark on the first line of a `--file` target list is consumed**
+  rather than becoming part of the first domain.
+
+### Changed
+
+- **The DMARC rollout gates both enforcing rungs on DKIM.** A domain with no
+  usable key is told, on stage 2 and stage 3, not to publish until signing is in
+  place, and gets a prerequisite step pointing at the DKIM section before either
+  record. Previously the ladder was identical whatever the DKIM state, so a
+  domain that followed it to the end earned `combo.enforcing_without_dkim` at
+  severity critical — the tool's own advice produced its own worst finding. The
+  gate uses the same predicate as that finding, so the two cannot disagree.
+  A delegation resolving to nothing and an unobservable wildcard zone are both
+  treated as no key, because mail is unsigned in every one of those cases.
+- The generated records themselves are unchanged.
+
 ## [1.0.0] - 2026-08-11
 
 First release.
@@ -90,8 +126,8 @@ First release.
   was removed from one that could not be read, and reports score movement that
   occurred without any record changing.
 - `mailauth report` generates a client-facing one-pager containing the exact
-  records to publish, with a staged DMARC rollout whose intervals and `pct`
-  ladder are configuration rather than literals.
+  records to publish, with a staged DMARC rollout whose stage intervals are
+  configuration rather than literals.
 
 ### Scope
 

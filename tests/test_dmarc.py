@@ -242,3 +242,179 @@ def test_a_resolver_failure_produces_no_absence_finding() -> None:
     codes = {f.code for f in result.findings}
     assert "dmarc.unreachable" in codes
     assert "dmarc.absent" not in codes
+
+
+# ---------------------------------------------------------------------------
+# the t tag: RFC 9989 policy test mode
+#
+# t=y asks receivers not to apply the published policy while the owner tests
+# (RFC 9989 section 4.7). A receiver still on RFC 7489 treats t as an unknown
+# tag and MUST ignore it (section 6.3), applying the policy as published. The
+# tool records that the tag is present; it does not compute an effective policy,
+# because the text defines an owner expectation rather than a receiver rule.
+# ---------------------------------------------------------------------------
+
+MUST_FIRE = [
+    ("quarantine, lowercase", "v=DMARC1; p=quarantine; t=y; rua=mailto:r@example.com"),
+    ("quarantine, uppercase", "v=DMARC1; p=quarantine; t=Y; rua=mailto:r@example.com"),
+    ("reject, no rua", "v=DMARC1; p=reject; t=y"),
+    ("p capitalised", "v=DMARC1; p=Quarantine; t=y; rua=mailto:r@example.com"),
+    ("p uppercase", "v=DMARC1; p=REJECT; t=y; rua=mailto:r@example.com"),
+]
+
+MUST_STAY_SILENT = [
+    ("t=n", "v=DMARC1; p=reject; t=n; rua=mailto:r@example.com"),
+    ("t=N", "v=DMARC1; p=reject; t=N; rua=mailto:r@example.com"),
+    ("t=maybe", "v=DMARC1; p=reject; t=maybe; rua=mailto:r@example.com"),
+    ("t empty", "v=DMARC1; p=reject; t=; rua=mailto:r@example.com"),
+    ("t absent", "v=DMARC1; p=reject; rua=mailto:r@example.com"),
+    ("t=yes", "v=DMARC1; p=reject; t=yes; rua=mailto:r@example.com"),
+    ("t=y:s", "v=DMARC1; p=reject; t=y:s; rua=mailto:r@example.com"),
+    # The gate: the finding's copy speaks only about p, and is only true when p
+    # is enforcing. See the comment at the emit site in checks/dmarc.py.
+    ("p=none", "v=DMARC1; p=none; t=y; rua=mailto:r@example.com"),
+    ("p absent", "v=DMARC1; t=y; rua=mailto:r@example.com"),
+    ("p empty", "v=DMARC1; p=; t=y; rua=mailto:r@example.com"),
+    ("p invalid", "v=DMARC1; p=foo; t=y; rua=mailto:r@example.com"),
+    ("p absent, no rua", "v=DMARC1; t=y"),
+]
+
+
+def dmarc_codes(record: str) -> set[str]:
+    resolver = FakeResolver({("_dmarc.t.test", "TXT"): [record]})
+    return {f.code for f in dmarc.check(resolver, "t.test").findings}
+
+
+@pytest.mark.parametrize("label,record", MUST_FIRE, ids=[m[0] for m in MUST_FIRE])
+def test_policy_test_mode_fires(label: str, record: str) -> None:
+    assert "dmarc.policy_test_mode" in dmarc_codes(record), label
+
+
+@pytest.mark.parametrize(
+    "label,record", MUST_STAY_SILENT, ids=[m[0] for m in MUST_STAY_SILENT]
+)
+def test_policy_test_mode_stays_silent(label: str, record: str) -> None:
+    assert "dmarc.policy_test_mode" not in dmarc_codes(record), label
+
+
+# The property reads t alone and knows nothing about p. The gate lives at the
+# emit site, so these lists are deliberately separate from MUST_FIRE and
+# MUST_STAY_SILENT above: a record can set t=y (property True) and still emit no
+# finding (gated on p).
+PROPERTY_TRUE = [
+    ("lowercase", "v=DMARC1; p=quarantine; t=y"),
+    ("uppercase", "v=DMARC1; p=quarantine; t=Y"),
+    ("p=none still sets the tag", "v=DMARC1; p=none; t=y"),
+    ("p absent still sets the tag", "v=DMARC1; t=y"),
+]
+PROPERTY_FALSE = [
+    ("t=n", "v=DMARC1; p=reject; t=n"),
+    ("t=N", "v=DMARC1; p=reject; t=N"),
+    ("t=maybe", "v=DMARC1; p=reject; t=maybe"),
+    ("t empty", "v=DMARC1; p=reject; t="),
+    ("t absent", "v=DMARC1; p=reject"),
+    ("t=yes", "v=DMARC1; p=reject; t=yes"),
+    ("t=y:s", "v=DMARC1; p=reject; t=y:s"),
+]
+
+
+@pytest.mark.parametrize("label,record", PROPERTY_TRUE, ids=[m[0] for m in PROPERTY_TRUE])
+def test_the_property_reads_the_t_tag_alone(label: str, record: str) -> None:
+    from mailauth.models import DmarcResult
+
+    assert DmarcResult(tags=dmarc.parse_tags(record)).policy_test_mode, label
+
+
+@pytest.mark.parametrize("label,record", PROPERTY_FALSE, ids=[m[0] for m in PROPERTY_FALSE])
+def test_the_property_is_false_for_everything_else(label: str, record: str) -> None:
+    from mailauth.models import DmarcResult
+
+    assert not DmarcResult(tags=dmarc.parse_tags(record)).policy_test_mode, label
+
+
+def test_the_property_strips_whitespace_when_tags_bypass_the_parser() -> None:
+    """Reaches the property's own .strip(), which parse_tags otherwise pre-empts.
+
+    parse_tags strips values, so a padded tag routed through it can never
+    exercise this. Tags also reach DmarcResult from the stored run history, so
+    the strip is real defence and needs a test that actually gets to it.
+    """
+    from mailauth.models import DmarcResult
+
+    assert DmarcResult(tags={"t": " y "}).policy_test_mode is True
+    assert DmarcResult(tags={"t": "\ty\n"}).policy_test_mode is True
+    assert DmarcResult(tags={"t": " n "}).policy_test_mode is False
+
+
+def test_the_finding_names_the_published_policy() -> None:
+    result = dmarc.check(
+        FakeResolver({("_dmarc.t.test", "TXT"): ["v=DMARC1; p=quarantine; t=y"]}),
+        "t.test",
+    )
+    finding = next(f for f in result.findings if f.code == "dmarc.policy_test_mode")
+    assert finding.title == "DMARC record is in test mode (t=y)"
+    assert "p=quarantine" in finding.detail
+    assert "RFC 9989" in finding.detail
+    assert str(finding.severity) == "warning"
+    assert str(finding.confidence) == "high"
+
+
+def test_the_finding_carries_no_weight(weights) -> None:
+    """Weight 0 on purpose: this records an observable, it does not price it."""
+    assert weights.get("dmarc.policy_test_mode").weight == 0
+
+
+def test_a_dkim_key_in_test_mode_does_not_trip_the_dmarc_guard() -> None:
+    """t=y in a DKIM key record is a different tags mapping with a different meaning.
+
+    checks/dkim.py:134 reads t from a DKIM key, where it marks the key as being
+    in test mode. That must not leak into the DMARC assessment, and the DMARC
+    tag must not change the DKIM reading.
+    """
+    from mailauth.checks import dkim as dkim_check
+    from mailauth.engine import check_domain
+    from tests.conftest import RSA_2048_P
+
+    zone = {
+        ("k.test", "TXT"): ["v=spf1 -all"],
+        ("k.test", "MX"): ["10 mail.k.test"],
+        ("mail.k.test", "A"): ["192.0.2.1"],
+        # DMARC record with NO t tag.
+        ("_dmarc.k.test", "TXT"): ["v=DMARC1; p=reject; rua=mailto:r@k.test"],
+        # DKIM key record WITH t=y.
+        ("default._domainkey.k.test", "TXT"): [f"v=DKIM1; k=rsa; t=y; p={RSA_2048_P}"],
+    }
+    result = check_domain(FakeResolver(zone), "k.test")
+    codes = {f.code for f in result.findings}
+
+    assert "dmarc.policy_test_mode" not in codes
+    assert not result.dmarc.policy_test_mode
+    # The DKIM side is unchanged: the key is still read as being in test mode.
+    assert "dkim.testing_mode" in codes
+    assert dkim_check.parse_key_record(
+        "default", f"v=DKIM1; k=rsa; t=y; p={RSA_2048_P}"
+    ).testing
+
+
+def test_sp_enforcing_under_p_none_is_a_known_suppression() -> None:
+    """A record in real test mode for its subdomains, which we do not report.
+
+    RFC 9989 section 4.7 names "sp" and "np" alongside "p": the t tag signals
+    whether the owner wants the policy declared in any of the three applied.
+    This record publishes p=none with sp=reject, so it is in meaningful test
+    mode for its subdomains - a receiver implementing RFC 9989 is asked not to
+    apply that sp=reject, and a receiver still on RFC 7489 applies it.
+
+    The gate suppresses it deliberately. dmarc.policy_test_mode's copy speaks
+    only about p, and on p=none that copy is false. Covering the sp and np case
+    needs a separate finding with its own copy, which does not exist yet. This
+    test exists so the gap is recorded as a gap rather than read as correctness.
+    """
+    record = "v=DMARC1; p=none; sp=reject; t=y; rua=mailto:r@example.com"
+    resolver = FakeResolver({("_dmarc.t.test", "TXT"): [record]})
+    result = dmarc.check(resolver, "t.test")
+
+    assert "dmarc.policy_test_mode" not in {f.code for f in result.findings}
+    # The tag is set and the model still says so; only the finding is withheld.
+    assert result.policy_test_mode
+    assert result.tags["sp"] == "reject"

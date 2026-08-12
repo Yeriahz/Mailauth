@@ -264,6 +264,19 @@ class DmarcResult:
         return self.tags.get("p", "").lower()
 
     @property
+    def policy_test_mode(self) -> bool:
+        """Whether the record sets t=y, the RFC 9989 policy test mode tag.
+
+        Case is folded and surrounding whitespace stripped at the read site, the
+        way every other consumed tag value is handled: the parser preserves
+        tag-value case, so a comparison against a bare "y" would miss t=Y.
+
+        True only for exactly "y". Absent, empty, "n", "maybe" and near-misses
+        such as "yes" are all False.
+        """
+        return self.tags.get("t", "").strip().lower() == "y"
+
+    @property
     def subdomain_policy(self) -> str:
         return self.tags.get("sp", "").lower()
 

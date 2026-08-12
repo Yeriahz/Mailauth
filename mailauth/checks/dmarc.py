@@ -226,6 +226,39 @@ def check(resolver: Resolver, domain: str) -> DmarcResult:
             )
         )
 
+    # -- policy test mode --------------------------------------------------
+    # Restricted to an enforcing p, because that is the only case the copy below
+    # is true for.
+    #
+    # On p=none both receiver classes take no action: one is asked not to apply a
+    # policy that does nothing, the other applies a policy that does nothing. The
+    # sentence about handling differing between receivers is therefore false
+    # there, not merely unhelpful.
+    #
+    # On an absent, empty or invalid p there is no policy to name, and
+    # dmarc.invalid_policy already carries the record.
+    #
+    # The gate lives here rather than on the model because it is a property of
+    # what this copy asserts, not of the tag. DmarcResult.policy_test_mode reads
+    # t alone and stays that way.
+    if DmarcResult(tags=tags).policy_test_mode and policy in ("quarantine", "reject"):
+        findings.append(
+            _finding(
+                "dmarc.policy_test_mode",
+                Severity.WARNING,
+                Confidence.HIGH,
+                "DMARC record is in test mode (t=y)",
+                f"This record publishes p={policy} and also sets t=y. Under RFC 9989 "
+                f"that tag asks receivers not to apply the published policy while the "
+                f"domain owner is testing. Receivers that have not implemented "
+                f"RFC 9989 ignore tags they do not recognise and apply p={policy} as "
+                f"published. How this domain's failing mail is actually handled "
+                f"therefore differs between receivers, and cannot be determined from "
+                f"DNS alone.",
+                t=tags.get("t", ""),
+            )
+        )
+
     # -- pct ---------------------------------------------------------------
     pct_raw = tags.get("pct", "100")
     try:
