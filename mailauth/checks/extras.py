@@ -19,6 +19,7 @@ from __future__ import annotations
 import urllib.error
 import urllib.request
 
+from .. import __version__
 from ..dns_client import Resolver, prefixed
 from ..models import (
     Confidence,
@@ -34,7 +35,10 @@ from ..models import (
 MAX_POLICY_BYTES = 64 * 1024
 POLICY_TIMEOUT = 10.0
 
-USER_AGENT = "mailauth/2.0 (+passive email authentication review)"
+# Derived, never written out. This is the only string this tool sends to a
+# server outside the user's control, and a hardcoded one drifts silently: it
+# read "mailauth/2.0" against a 1.0.0 package.
+USER_AGENT = f"mailauth/{__version__} (+passive email authentication review)"
 
 
 def parse_semicolon_tags(record: str) -> dict[str, str]:

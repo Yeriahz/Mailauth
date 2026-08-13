@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mailauth"
-version = "1.0.0"
+version = "1.1.0"
 description = "Passive email authentication review over public DNS: SPF, DKIM, DMARC, MTA-STS, TLS-RPT and BIMI."
 readme = "README.md"
 license = "MIT"

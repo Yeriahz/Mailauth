@@ -396,6 +396,147 @@ def test_a_dkim_key_in_test_mode_does_not_trip_the_dmarc_guard() -> None:
     ).testing
 
 
+# ---------------------------------------------------------------------------
+# the p finding's copy under test mode
+#
+# The default detail on an enforcing p states what the record asks receivers to
+# do. On a t=y record it asks the opposite, so the default text is false there
+# and contradicts dmarc.policy_test_mode on the same page. Each enforcing policy
+# gets one alternative detail, selected on the same predicate that gates
+# dmarc.policy_test_mode. Nothing else about either finding varies.
+# ---------------------------------------------------------------------------
+
+QUARANTINE_DETAIL = (
+    "Failing mail is asked to be treated as suspicious rather than delivered normally."
+)
+QUARANTINE_TEST_MODE_DETAIL = (
+    "The record requests that failing mail be treated as suspicious. It also sets "
+    "t=y, which asks receivers not to apply that request, so this policy is "
+    "published but not necessarily in effect."
+)
+REJECT_DETAIL = ""
+REJECT_TEST_MODE_DETAIL = (
+    "The record requests that failing mail be rejected. It also sets t=y, which "
+    "asks receivers not to apply that request, so this policy is published but "
+    "not necessarily in effect."
+)
+
+# The sentence that was false on a t=y record. It must not survive anywhere on
+# such a page, under any finding.
+FALSE_ON_TEST_MODE = "treated as suspicious rather than delivered normally"
+
+
+def dmarc_detail(record: str, code: str) -> str:
+    """The rendered detail of one finding, for a record read at t.test."""
+    resolver = FakeResolver({("_dmarc.t.test", "TXT"): [record]})
+    result = dmarc.check(resolver, "t.test")
+    return next(f for f in result.findings if f.code == code).detail
+
+
+@pytest.mark.parametrize(
+    "record,code,expected",
+    [
+        (
+            "v=DMARC1; p=quarantine; t=y; rua=mailto:r@example.com",
+            "dmarc.policy_quarantine",
+            QUARANTINE_TEST_MODE_DETAIL,
+        ),
+        (
+            "v=DMARC1; p=reject; t=y; rua=mailto:r@example.com",
+            "dmarc.policy_reject",
+            REJECT_TEST_MODE_DETAIL,
+        ),
+    ],
+    ids=["quarantine", "reject"],
+)
+def test_test_mode_selects_the_alternative_detail(
+    record: str, code: str, expected: str
+) -> None:
+    assert dmarc_detail(record, code) == expected
+
+
+@pytest.mark.parametrize(
+    "record,code,expected",
+    [
+        (
+            "v=DMARC1; p=quarantine; rua=mailto:r@example.com",
+            "dmarc.policy_quarantine",
+            QUARANTINE_DETAIL,
+        ),
+        (
+            "v=DMARC1; p=quarantine; t=n; rua=mailto:r@example.com",
+            "dmarc.policy_quarantine",
+            QUARANTINE_DETAIL,
+        ),
+        (
+            "v=DMARC1; p=quarantine; t=maybe; rua=mailto:r@example.com",
+            "dmarc.policy_quarantine",
+            QUARANTINE_DETAIL,
+        ),
+        (
+            "v=DMARC1; p=reject; rua=mailto:r@example.com",
+            "dmarc.policy_reject",
+            REJECT_DETAIL,
+        ),
+        (
+            "v=DMARC1; p=reject; t=n; rua=mailto:r@example.com",
+            "dmarc.policy_reject",
+            REJECT_DETAIL,
+        ),
+        (
+            "v=DMARC1; p=reject; t=maybe; rua=mailto:r@example.com",
+            "dmarc.policy_reject",
+            REJECT_DETAIL,
+        ),
+    ],
+    ids=[
+        "quarantine, no t",
+        "quarantine, t=n",
+        "quarantine, t=maybe",
+        "reject, no t",
+        "reject, t=n",
+        "reject, t=maybe",
+    ],
+)
+def test_without_test_mode_the_original_detail_is_kept(
+    record: str, code: str, expected: str
+) -> None:
+    assert dmarc_detail(record, code) == expected
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        "v=DMARC1; p=quarantine; t=y; rua=mailto:r@example.com",
+        "v=DMARC1; p=reject; t=y; rua=mailto:r@example.com",
+    ],
+    ids=["quarantine", "reject"],
+)
+def test_the_false_sentence_is_absent_from_the_whole_page(record: str) -> None:
+    """A page-level guard, not a per-finding one.
+
+    The complaint was that the report as a whole asserted enforcement on a
+    record that asks receivers not to enforce. Checking only
+    dmarc.policy_quarantine would let the sentence reappear under any other
+    finding, so this reads every finding in the assembled result.
+    """
+    from mailauth.engine import check_domain
+
+    zone = {
+        ("t.test", "TXT"): ["v=spf1 -all"],
+        ("t.test", "MX"): ["10 mail.t.test"],
+        ("mail.t.test", "A"): ["192.0.2.1"],
+        ("_dmarc.t.test", "TXT"): [record],
+    }
+    result = check_domain(FakeResolver(zone), "t.test")
+
+    offenders = [f.code for f in result.findings if FALSE_ON_TEST_MODE in f.detail]
+    assert offenders == [], offenders
+    # The page is not empty of DMARC policy copy - the finding is still there,
+    # carrying the other detail.
+    assert "dmarc.policy_test_mode" in {f.code for f in result.findings}
+
+
 def test_sp_enforcing_under_p_none_is_a_known_suppression() -> None:
     """A record in real test mode for its subdomains, which we do not report.
 

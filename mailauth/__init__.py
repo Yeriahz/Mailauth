@@ -9,7 +9,7 @@ port scanning and no web crawling anywhere in this package, by design.
 
 from __future__ import annotations
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __author__ = "Jeriah Keith"
 __email__ = "yeriahz@sscsnv.com"
 __url__ = "https://github.com/Yeriahz/Mailauth"

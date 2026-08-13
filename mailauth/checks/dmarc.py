@@ -33,6 +33,37 @@ VALID_POLICIES = ("none", "quarantine", "reject")
 # mailto:dmarc@example.com!10m  ->  the URI, with an optional size limit suffix
 MAILTO_RE = re.compile(r"^mailto:([^!\s]+)(?:!(\d+[kmgt]?))?$", re.IGNORECASE)
 
+# -- the p findings' copy ---------------------------------------------------
+#
+# An enforcing policy gets a second detail, used when and only when the record
+# also sets t=y. The default text states what the record asks receivers to do,
+# which on a t=y record is the opposite of what the record asks: t=y asks them
+# not to apply it. Saying it plainly there would contradict dmarc.policy_test_mode
+# on the same page, and the contradiction is not a matter of emphasis - one of
+# the two sentences would be false.
+#
+# The test mode variants stay short on purpose. dmarc.policy_test_mode carries
+# the full explanation of why the two receiver classes differ, and it is emitted
+# on exactly the records these are selected for, so repeating it here would print
+# the same paragraph twice on one page.
+POLICY_QUARANTINE_DETAIL = (
+    "Failing mail is asked to be treated as suspicious rather than delivered normally."
+)
+POLICY_QUARANTINE_TEST_MODE_DETAIL = (
+    "The record requests that failing mail be treated as suspicious. It also sets "
+    "t=y, which asks receivers not to apply that request, so this policy is "
+    "published but not necessarily in effect."
+)
+# p=reject carries no detail outside test mode: the title says what the policy is
+# and there is nothing further to add. The variant exists because t=y makes the
+# published policy conditional, which the title alone cannot convey.
+POLICY_REJECT_DETAIL = ""
+POLICY_REJECT_TEST_MODE_DETAIL = (
+    "The record requests that failing mail be rejected. It also sets t=y, which "
+    "asks receivers not to apply that request, so this policy is published but "
+    "not necessarily in effect."
+)
+
 
 def is_dmarc_record(text: str) -> bool:
     """True for a TXT record that declares itself DMARC version 1.
@@ -178,6 +209,11 @@ def check(resolver: Resolver, domain: str) -> DmarcResult:
     record = records[0]
     tags = parse_tags(record)
     policy = tags.get("p", "").lower()
+    # Read once, here, because two separate places below depend on it: which
+    # detail the p finding carries, and whether dmarc.policy_test_mode is
+    # emitted at all. A second predicate could drift from this one and put the
+    # two findings back into contradiction, which is the failure being fixed.
+    test_mode = DmarcResult(tags=tags).policy_test_mode
 
     # -- policy ------------------------------------------------------------
     if policy not in VALID_POLICIES:
@@ -212,8 +248,9 @@ def check(resolver: Resolver, domain: str) -> DmarcResult:
                 Severity.OK,
                 Confidence.HIGH,
                 "DMARC policy is p=quarantine",
-                "Failing mail is asked to be treated as suspicious rather than "
-                "delivered normally.",
+                POLICY_QUARANTINE_TEST_MODE_DETAIL
+                if test_mode
+                else POLICY_QUARANTINE_DETAIL,
             )
         )
     else:
@@ -223,6 +260,7 @@ def check(resolver: Resolver, domain: str) -> DmarcResult:
                 Severity.OK,
                 Confidence.HIGH,
                 "DMARC policy is p=reject",
+                POLICY_REJECT_TEST_MODE_DETAIL if test_mode else POLICY_REJECT_DETAIL,
             )
         )
 
@@ -241,7 +279,7 @@ def check(resolver: Resolver, domain: str) -> DmarcResult:
     # The gate lives here rather than on the model because it is a property of
     # what this copy asserts, not of the tag. DmarcResult.policy_test_mode reads
     # t alone and stays that way.
-    if DmarcResult(tags=tags).policy_test_mode and policy in ("quarantine", "reject"):
+    if test_mode and policy in ("quarantine", "reject"):
         findings.append(
             _finding(
                 "dmarc.policy_test_mode",

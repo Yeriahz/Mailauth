@@ -9,7 +9,7 @@ public interface: they are the key into the weights file, the unit a diff is
 computed in, and the identifier a stored run is read back by. Renaming or
 removing one is a breaking change and gets an entry here.
 
-## [Unreleased]
+## [1.1.0] - 2026-08-12
 
 ### Added
 

@@ -26,6 +26,34 @@ from .models import Confidence, DomainResult, Posture, Severity
 from .providers import Provider, dns_host_guidance, identify
 from .scoring import DEFAULT_WEIGHTS_PATH
 
+# -- how the published DMARC policy is described in "What is published today" --
+#
+# Two mappings, selected on whether the record is in test mode. The default set
+# says what the policy does to mail. On a t=y record that is a claim about
+# handling the record explicitly asks receivers not to perform, so the enforcing
+# two get an alternative that describes the request rather than the outcome.
+#
+# Only quarantine and reject appear in the test mode set. DmarcResult's
+# policy_test_mode property reads the t tag alone and is therefore True on a
+# p=none record with t=y as well - a lookup that misses falls back to the
+# default line, which is correct there: p=none asks for nothing, so there is
+# nothing for t=y to withhold.
+POLICY_STATE = {
+    "none": "monitor only - failing mail is still delivered normally",
+    "quarantine": "quarantine - failing mail is treated as suspicious",
+    "reject": "reject - failing mail is refused",
+}
+POLICY_STATE_TEST_MODE = {
+    "quarantine": (
+        "quarantine, test mode - failing mail is to be treated as suspicious, but "
+        "t=y asks receivers not to act on that yet"
+    ),
+    "reject": (
+        "reject, test mode - failing mail is to be refused, but t=y asks receivers "
+        "not to act on that yet"
+    ),
+}
+
 
 @dataclass(frozen=True)
 class Rollout:
@@ -72,6 +100,29 @@ class RecordSuggestion:
             "note": self.note,
             "stage": self.stage,
         }
+
+
+def strip_test_mode_tag(record: str) -> str:
+    """Return `record` with its t tag removed and every other byte left alone.
+
+    The record handed to a client here is theirs, minus one tag. Regenerating a
+    canonical record instead would silently drop whatever else they publish -
+    an adkim, a ruf, a second rua, a size limit on the one they have - and the
+    client pastes it in without knowing what left. Splitting on the separator
+    and dropping the one part keeps tag order, spacing and value case exactly as
+    published.
+
+    Every t tag goes, not only the first: a record with two of them is malformed,
+    and leaving the duplicate behind would leave the domain in test mode.
+    """
+    parts = [part for part in record.split(";") if not _is_test_mode_tag(part)]
+    return ";".join(parts)
+
+
+def _is_test_mode_tag(part: str) -> bool:
+    """True for one `t=...` element of a DMARC record, in any case or spacing."""
+    key, separator, _ = part.strip().partition("=")
+    return bool(separator) and key.strip().lower() == "t"
 
 
 def dmarc_rollout(domain: str, result: DomainResult) -> list[RecordSuggestion]:
@@ -203,6 +254,72 @@ def dmarc_rollout(domain: str, result: DomainResult) -> list[RecordSuggestion]:
         )
         return suggestions
 
+    # -- test mode ---------------------------------------------------------
+    # Only quarantine and reject reach this line; the two branches above return.
+    # A domain here publishes an enforcing policy and asks receivers not to apply
+    # it, so the next step is not the next policy - it is removing the tag, and
+    # nothing above it in the ladder says so.
+    #
+    # Which step depends on dkim_ready, read here and not modified: on a domain
+    # with no usable key, removing t=y is what makes the published policy apply
+    # to the receivers that were honouring the tag, so a step handing over the
+    # record with the tag gone is advice to widen enforcement on mail nothing
+    # signs. It does not follow that the tag is protecting that mail today - a
+    # receiver still on RFC 7489 ignores t and enforces already, which is why the
+    # note below says "may already be refused" rather than crediting the tag with
+    # keeping anything. The two branches are opposite instructions, not the same
+    # instruction with a caveat, which is why this one place selects rather than
+    # qualifies. The escalation rungs below keep their qualify-don't-suppress
+    # behaviour untouched.
+    #
+    # The "not yet" step carries the record already published, unchanged.
+    # RecordSuggestion has no way to express a step with no record - the
+    # Host/Type/Value block in _render_record is unconditional - and the closest
+    # honest thing inside the existing structure is to show what is already there
+    # and say to leave it alone. Pasting it back changes nothing.
+    #
+    # `record` is None only when a DmarcResult was assembled without one, which
+    # no live check produces; there is nothing to strip a tag from in that case.
+    published = result.dmarc.record
+    if published and result.dmarc.policy_test_mode:
+        if dkim_ready:
+            suggestions.append(
+                RecordSuggestion(
+                    host="_dmarc",
+                    rtype="TXT",
+                    value=strip_test_mode_tag(published),
+                    stage=f"First - remove the t=y tag{caveat_suffix}",
+                    note=(
+                        f"The record carries t=y, which asks receivers not to apply the "
+                        f"published policy while the domain owner is testing. Removing "
+                        f"that tag is the step that puts p={policy} into effect. It is "
+                        f"not a change of policy: the value above is the current record "
+                        f"with the one tag taken out and everything else left as it is."
+                        + ("" if dkim_ready else signing_caveat)
+                    ),
+                )
+            )
+        else:
+            suggestions.append(
+                RecordSuggestion(
+                    host="_dmarc",
+                    rtype="TXT",
+                    value=published,
+                    stage="Not yet - keep the t=y tag until DKIM is signing",
+                    note=(
+                        f"The record carries t=y, which asks receivers not to apply "
+                        f"p={policy} while the domain owner is testing. Receivers that "
+                        f"have not implemented RFC 9989 ignore that tag and apply "
+                        f"p={policy} as published, so some forwarded mail may already be "
+                        f"refused - a reason to finish the DKIM step below sooner, not a "
+                        f"reason to relax. The value above is what is published today; "
+                        f"leave it as it is until outbound mail is signed and the reports "
+                        f"show it passing DKIM. Removing the tag then is what makes the "
+                        f"policy apply everywhere."
+                    ),
+                )
+            )
+
     if policy == "quarantine":
         suggestions.append(
             RecordSuggestion(
@@ -214,8 +331,18 @@ def dmarc_rollout(domain: str, result: DomainResult) -> list[RecordSuggestion]:
                     f"reports{caveat_suffix}"
                 ),
                 note=(
-                    "The remaining step. Quarantine already moves failing mail out of "
-                    "the inbox; reject stops it being accepted at all."
+                    (
+                        # Same reason as the published-policy line in
+                        # _plain_state, and the same predicate: "already moves"
+                        # states that the existing quarantine is being applied,
+                        # which is exactly what t=y asks receivers not to do.
+                        "The remaining step. The record already asks for failing mail "
+                        "to be kept out of the inbox, though t=y asks receivers not to "
+                        "act on that yet; reject asks for it not to be accepted at all."
+                        if result.dmarc.policy_test_mode
+                        else "The remaining step. Quarantine already moves failing mail "
+                        "out of the inbox; reject stops it being accepted at all."
+                    )
                     + ("" if dkim_ready else signing_caveat)
                 ),
             )
@@ -473,11 +600,17 @@ def _plain_state(result: DomainResult) -> list[str]:
             "no reports are collected showing who is sending as this domain."
         )
     else:
-        policy_text = {
-            "none": "monitor only - failing mail is still delivered normally",
-            "quarantine": "quarantine - failing mail is treated as suspicious",
-            "reject": "reject - failing mail is refused",
-        }.get(result.dmarc.policy, "no valid policy setting")
+        policy_text = POLICY_STATE.get(result.dmarc.policy, "no valid policy setting")
+        # A record in test mode asks receivers not to apply the policy it
+        # publishes, so a line saying what that policy does to mail describes
+        # something that may not be happening anywhere. The same property the
+        # DMARC check reads, so the page and the findings cannot disagree.
+        #
+        # p=none and an invalid p fall through to the line above: the test mode
+        # entries cover only the two enforcing policies, and on p=none there is
+        # nothing being applied for t=y to withhold.
+        if result.dmarc.policy_test_mode:
+            policy_text = POLICY_STATE_TEST_MODE.get(result.dmarc.policy, policy_text)
         reporting = (
             f"Reports are sent to {result.dmarc.tags['rua']}."
             if result.dmarc.tags.get("rua")
